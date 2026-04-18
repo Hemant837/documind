@@ -4,6 +4,7 @@ init_db() is called on startup — creates all PostgreSQL tables if they
 don't exist. Safe to call on every deploy.
 """
 
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -33,10 +34,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+_extra = os.getenv("ALLOWED_ORIGINS", "")
 ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://localhost:3000",
-    "https://yourdomain.com",  # replace with Vercel URL after deploy
+    *[o.strip() for o in _extra.split(",") if o.strip()],
 ]
 
 app.add_middleware(
