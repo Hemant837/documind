@@ -1,4 +1,5 @@
 # API
+fastapi[standard]
 python-multipart
 pydantic
 
@@ -11,10 +12,17 @@ openai
 tiktoken
 pypdf
 
-# Vector store — ChromaDB replaces FAISS
-# Run the server with: chroma run --path ./chroma_data
+# Vector store
 chromadb
-chromadb-client
+
+# Database
+sqlalchemy[asyncio]
+asyncpg
+
+# Auth — JWT verification + password hashing + Google OAuth
+python-jose[cryptography]
+passlib[bcrypt]
+httpx
 
 # Utilities
 python-dotenv

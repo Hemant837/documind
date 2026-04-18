@@ -1,12 +1,12 @@
 {
   "$schema": "https://ui.shadcn.com/schema.json",
-  "style": "radix-nova",
-  "rsc": true,
+  "style": "base-nova",
+  "rsc": false,
   "tsx": true,
   "tailwind": {
     "config": "",
-    "css": "app/globals.css",
-    "baseColor": "neutral",
+    "css": "src/index.css",
+    "baseColor": "mist",
     "cssVariables": true,
     "prefix": ""
   },
@@ -20,6 +20,6 @@
     "hooks": "@/hooks"
   },
   "menuColor": "default",
-  "menuAccent": "subtle",
+  "menuAccent": "bold",
   "registries": {}
 }

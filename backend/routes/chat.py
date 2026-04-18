@@ -1,32 +1,19 @@
 """
-routes/chat.py
---------------
-Handles question-answering and chat history retrieval.
-
-Endpoints:
-  POST /chat/stream            — streaming SSE response (primary)
-  POST /chat/                  — non-streaming fallback
-  GET  /chat/history/{session_id} — fetch full conversation
-  GET  /chat/history              — list all sessions
-  DELETE /chat/history/{session_id} — clear a conversation
-
-Streaming vs non-streaming:
-  The stream endpoint uses FastAPI's StreamingResponse with text/event-stream.
-  The frontend reads tokens as they arrive and renders them progressively.
-  The non-streaming endpoint is kept for testing and as a fallback.
+All routes now receive an AsyncSession via Depends(get_db).
+The session is committed automatically by get_db() on clean exit.
 """
 
-import asyncio
-
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from services.history import chat_history
+import services.history as history
+from services.auth import get_current_user
+from services.database import User, get_db
 from services.rag import NoContentFoundError, NoDocumentsError, document_store
 
 router = APIRouter()
-
 
 # ---------------------------------------------------------------------------
 # Schemas
@@ -34,7 +21,7 @@ router = APIRouter()
 
 class QuestionRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=1000)
-    session_id: str = Field(..., min_length=1, description="Frontend-generated conversation ID")
+    session_id: str = Field(..., min_length=1)
     doc_ids: list[str] | None = None
 
     @field_validator("doc_ids", mode="before")
@@ -43,7 +30,7 @@ class QuestionRequest(BaseModel):
         if v is None:
             return v
         if not v:
-            raise ValueError("doc_ids must not be an empty list. Pass null to search all documents.")
+            raise ValueError("doc_ids must not be an empty list.")
         if any(not isinstance(d, str) or not d.strip() for d in v):
             raise ValueError("Each doc_id must be a non-empty string.")
         return v
@@ -64,36 +51,31 @@ class MessageResponse(BaseModel):
 
 class SessionResponse(BaseModel):
     session_id: str
+    title: str | None
     message_count: int
     started_at: str
 
 
 # ---------------------------------------------------------------------------
-# Streaming endpoint (primary)
+# Streaming endpoint
 # ---------------------------------------------------------------------------
 
-@router.post(
-    "/stream",
-    summary="Ask a question with streaming SSE response",
-)
-async def ask_question_stream(data: QuestionRequest):
+@router.post("/stream", summary="Ask a question with streaming SSE response")
+async def ask_question_stream(
+    data: QuestionRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """
     Returns a Server-Sent Events stream.
-
-    The client reads the stream line by line:
-      - "data: <token>"         → append token to the current message
-      - "data: [SOURCES]<json>" → parse JSON and render citation chips
-      - "data: [ERROR]<msg>"    → surface error to the user
-      - "data: [DONE]"          → stream finished
-
-    NoDocumentsError and NoContentFoundError are caught here and sent as
-    [ERROR] events so the frontend can handle them gracefully without
-    the stream just hanging.
+    The db session is injected per request — history is saved inside
+    the stream generator using this session.
     """
     async def event_generator():
         try:
             async for chunk in document_store.ask_question_stream(
-                data.question, data.session_id, data.doc_ids
+                data.question, data.session_id, db, data.doc_ids,
+                user_id=current_user.id,
             ):
                 yield chunk
         except NoDocumentsError as e:
@@ -108,7 +90,6 @@ async def ask_question_stream(data: QuestionRequest):
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
-        # These headers prevent proxies and browsers from buffering the stream
         headers={
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
@@ -117,26 +98,19 @@ async def ask_question_stream(data: QuestionRequest):
 
 
 # ---------------------------------------------------------------------------
-# Non-streaming endpoint (fallback)
+# Non-streaming endpoint
 # ---------------------------------------------------------------------------
 
-@router.post(
-    "/",
-    response_model=QuestionResponse,
-    status_code=status.HTTP_200_OK,
-    summary="Ask a question (non-streaming)",
-)
-async def ask_question_endpoint(data: QuestionRequest):
-    """
-    Blocking version — waits for the full LLM response before returning.
-    Useful for testing, scripts, or clients that don't support SSE.
-    """
+@router.post("/", response_model=QuestionResponse, status_code=status.HTTP_200_OK)
+async def ask_question_endpoint(
+    data: QuestionRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     try:
-        result = await asyncio.to_thread(
-            document_store.ask_question,
-            data.question,
-            data.session_id,
-            data.doc_ids,
+        result = await document_store.ask_question(
+            data.question, data.session_id, db, data.doc_ids,
+            user_id=current_user.id,
         )
     except NoDocumentsError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -162,13 +136,12 @@ async def ask_question_endpoint(data: QuestionRequest):
 # History endpoints
 # ---------------------------------------------------------------------------
 
-@router.get(
-    "/history/{session_id}",
-    response_model=list[MessageResponse],
-    summary="Get full conversation history for a session",
-)
-async def get_session_history(session_id: str):
-    messages = await asyncio.to_thread(chat_history.get_all, session_id)
+@router.get("/history/{session_id}", response_model=list[MessageResponse])
+async def get_session_history(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    messages = await history.get_all_messages(db, session_id)
     if not messages:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -177,20 +150,20 @@ async def get_session_history(session_id: str):
     return messages
 
 
-@router.get(
-    "/history",
-    response_model=list[SessionResponse],
-    summary="List all chat sessions",
-)
-async def list_sessions():
-    sessions = await asyncio.to_thread(chat_history.get_sessions)
-    return sessions
+@router.get("/history", response_model=list[SessionResponse])
+async def list_sessions(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await history.get_all_sessions(db, user_id=current_user.id, limit=limit, offset=offset)
 
 
-@router.delete(
-    "/history/{session_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-    summary="Delete all messages in a session",
-)
-async def delete_session(session_id: str):
-    await asyncio.to_thread(chat_history.delete_session, session_id)
+@router.delete("/history/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_session_route(
+    session_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await history.delete_session(db, session_id, user_id=current_user.id)
