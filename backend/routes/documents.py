@@ -3,8 +3,6 @@ Document listing and deletion — scoped to the authenticated user.
 Postgres is the source of truth for document metadata; ChromaDB holds the vectors.
 """
 
-import asyncio
-
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -64,7 +62,7 @@ async def delete_document(
         )
 
     try:
-        await asyncio.to_thread(document_store.delete_document_by_id, doc_id)
+        await document_store.delete_document_by_id(doc_id, db)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

@@ -123,8 +123,26 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 async def init_db() -> None:
     """Create all tables on startup. Safe to call repeatedly."""
     async with engine.begin() as conn:
+        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         await conn.run_sync(Base.metadata.create_all)
         # Idempotent column migrations for tables that may predate model changes
         await conn.execute(text(
             "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT"
+        ))
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS document_chunks (
+                id        TEXT PRIMARY KEY,
+                doc_id    TEXT NOT NULL,
+                user_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                file_name TEXT NOT NULL,
+                page      TEXT NOT NULL,
+                content   TEXT NOT NULL,
+                embedding vector(1536) NOT NULL
+            )
+        """))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_chunks_doc_id  ON document_chunks(doc_id)"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_chunks_user_id ON document_chunks(user_id)"
         ))

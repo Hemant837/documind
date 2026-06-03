@@ -12,8 +12,7 @@ openai
 tiktoken
 pypdf
 
-# Vector store
-chromadb
+# Vector store (pgvector via raw SQL — no separate service needed)
 
 # Database
 sqlalchemy[asyncio]

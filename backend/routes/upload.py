@@ -3,7 +3,6 @@ Upload route: accepts a PDF, checks for duplicates, processes it through the
 RAG pipeline, persists metadata to Postgres, and returns the doc_id.
 """
 
-import asyncio
 import os
 import re
 import shutil
@@ -83,8 +82,8 @@ async def upload_file(
         with open(file_path, "wb") as f:
             f.write(contents)
 
-        doc_id = await asyncio.to_thread(
-            document_store.process_document, file_path, current_user.id
+        doc_id = await document_store.process_document(
+            file_path, current_user.id, db
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))

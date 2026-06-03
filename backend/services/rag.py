@@ -1,25 +1,19 @@
 """
-Updated for per-user document scoping.
-
-What changed:
-  - process_document() accepts user_id, stores it in ChromaDB metadata
-  - list_documents() filters by user_id
-  - delete_document() verifies ownership before deleting
-  - ask_question / ask_question_stream pass user_id to history and
-    add it to the ChromaDB filter so users only search their own docs
+RAG service using PostgreSQL pgvector.
+Replaces ChromaDB — all vector operations run against the same Neon Postgres
+instance, so no separate service is needed.
 """
 
+import asyncio
 import json
 import os
 import uuid
-from threading import Lock
 from typing import AsyncGenerator
 
-import chromadb
-from chromadb.config import Settings
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from dotenv import load_dotenv
 
@@ -35,16 +29,10 @@ MAX_SOURCES = 4
 MIN_SOURCES = 3
 HISTORY_TURNS = 10
 
-CHROMA_HOST = os.getenv("CHROMA_HOST", "localhost")
-CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8001"))
-CHROMA_API_KEY = os.getenv("CHROMA_API_KEY", "")       # set in production → uses Chroma Cloud
-CHROMA_TENANT = os.getenv("CHROMA_TENANT", "")
-CHROMA_DATABASE = os.getenv("CHROMA_DATABASE", "default_database")
-CHROMA_COLLECTION = "documents"
-
 
 class NoDocumentsError(Exception):
     pass
+
 
 class NoContentFoundError(Exception):
     pass
@@ -78,29 +66,9 @@ You are a precise document assistant. Follow these rules strictly:
 """
 
 
-def _build_where_filter(
-    user_id: str,
-    doc_ids: list[str] | None,
-) -> dict:
-    """
-    Build a ChromaDB where filter that always scopes to user_id,
-    optionally further filtered by specific doc_ids.
-
-    ChromaDB's $and operator combines multiple conditions.
-    """
-    user_filter = {"user_id": {"$eq": user_id}}
-
-    if not doc_ids:
-        return user_filter
-
-    doc_filter = (
-        {"doc_id": {"$eq": doc_ids[0]}}
-        if len(doc_ids) == 1
-        else {"doc_id": {"$in": doc_ids}}
-    )
-
-    # Combine user scope + doc scope with $and
-    return {"$and": [user_filter, doc_filter]}
+def _vec_literal(embedding: list[float]) -> str:
+    """Convert a float list to a PostgreSQL vector literal string."""
+    return "[" + ",".join(f"{x:.8f}" for x in embedding) + "]"
 
 
 def _dedupe_sources(metas: list[dict]) -> list[dict]:
@@ -119,65 +87,72 @@ async def _build_retrieval_inputs(
     session_id: str,
     doc_ids: list[str] | None,
     user_id: str,
-    collection,
     db: AsyncSession,
 ) -> tuple[str, list[dict]]:
     """Shared retrieval logic for both sync and streaming paths."""
 
-    # Check this user has any documents at all
-    user_docs = await __import__("asyncio").to_thread(
-        lambda: collection.get(
-            where={"user_id": {"$eq": user_id}},
-            include=[],
-            limit=1,
-        )
+    result = await db.execute(
+        text("SELECT 1 FROM document_chunks WHERE user_id = :uid LIMIT 1"),
+        {"uid": user_id},
     )
-    if not user_docs["ids"]:
+    if not result.scalar_one_or_none():
         raise NoDocumentsError("No documents have been uploaded yet.")
 
-    query_embedding = await __import__("asyncio").to_thread(
-        _embeddings.embed_query, query
-    )
+    query_embedding = await _embeddings.aembed_query(query)
+    vec = _vec_literal(query_embedding)
 
-    where_filter = _build_where_filter(user_id, doc_ids)
+    where_parts = ["user_id = :user_id"]
+    params: dict = {"user_id": user_id, "vec": vec, "k": TOP_K}
 
-    try:
-        results = await __import__("asyncio").to_thread(
-            lambda: collection.query(
-                query_embeddings=[query_embedding],
-                n_results=TOP_K,
-                where=where_filter,
-                include=["documents", "metadatas"],
-            )
+    if doc_ids:
+        if len(doc_ids) == 1:
+            where_parts.append("doc_id = :doc_id_0")
+            params["doc_id_0"] = doc_ids[0]
+        else:
+            placeholders = ", ".join(f":doc_id_{i}" for i in range(len(doc_ids)))
+            where_parts.append(f"doc_id IN ({placeholders})")
+            for i, d in enumerate(doc_ids):
+                params[f"doc_id_{i}"] = d
+
+    where_clause = " AND ".join(where_parts)
+
+    rows = (
+        await db.execute(
+            text(
+                f"SELECT file_name, page, content "
+                f"FROM document_chunks "
+                f"WHERE {where_clause} "
+                f"ORDER BY embedding <=> :vec::vector "
+                f"LIMIT :k"
+            ),
+            params,
         )
-    except Exception as e:
-        raise RuntimeError(f"Vector search failed: {e}") from e
+    ).mappings().all()
 
-    raw_docs = results["documents"][0]
-    raw_metas = results["metadatas"][0]
-
-    if not raw_docs:
+    if not rows:
         raise NoContentFoundError(
             "No relevant content found in the selected documents."
         )
 
     selected_texts, selected_metas = [], []
     seen_files: set = set()
-    for text, meta in zip(raw_docs, raw_metas):
-        fname = meta.get("file_name")
+    for row in rows:
+        fname = row["file_name"]
         if fname not in seen_files:
-            selected_texts.append(text)
-            selected_metas.append(meta)
+            selected_texts.append(row["content"])
+            selected_metas.append({"file_name": row["file_name"], "page": row["page"]})
             seen_files.add(fname)
         if len(selected_texts) >= MAX_SOURCES:
             break
 
     if len(selected_texts) < MIN_SOURCES:
-        selected_texts = raw_docs[:MIN_SOURCES]
-        selected_metas = raw_metas[:MIN_SOURCES]
+        selected_texts = [r["content"] for r in rows[:MIN_SOURCES]]
+        selected_metas = [
+            {"file_name": r["file_name"], "page": r["page"]} for r in rows[:MIN_SOURCES]
+        ]
 
     context = "\n\n".join(
-        f"[Source: {m.get('file_name')}, Page: {m.get('page')}]\n{t}"
+        f"[Source: {m['file_name']}, Page: {m['page']}]\n{t}"
         for t, m in zip(selected_texts, selected_metas)
     )
 
@@ -198,40 +173,22 @@ async def _build_retrieval_inputs(
 
 
 class DocumentStore:
-    def __init__(self):
-        self._lock = Lock()
-        if CHROMA_API_KEY:
-            self._client = chromadb.CloudClient(
-                tenant=CHROMA_TENANT,
-                database=CHROMA_DATABASE,
-                api_key=CHROMA_API_KEY,
-            )
-        else:
-            self._client = chromadb.HttpClient(
-                host=CHROMA_HOST,
-                port=CHROMA_PORT,
-                settings=Settings(anonymized_telemetry=False),
-            )
-        with self._lock:
-            self._collection = self._client.get_or_create_collection(
-                name=CHROMA_COLLECTION,
-                metadata={"hnsw:space": "cosine"},
-            )
-
     # ------------------------------------------------------------------
-    # Ingest — stores user_id in metadata
+    # Ingest
     # ------------------------------------------------------------------
 
-    def process_document(self, file_path: str, user_id: str) -> str:
+    async def process_document(
+        self, file_path: str, user_id: str, db: AsyncSession
+    ) -> str:
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"File not found: {file_path}")
 
-        doc_id = str(uuid.uuid4())
         file_name = os.path.basename(file_path)
 
         try:
-            loader = PyPDFLoader(file_path)
-            documents = loader.load()
+            documents = await asyncio.to_thread(
+                lambda: PyPDFLoader(file_path).load()
+            )
         except Exception as e:
             raise RuntimeError(f"Failed to load PDF '{file_name}': {e}") from e
 
@@ -239,82 +196,44 @@ class DocumentStore:
             raise ValueError(f"No content could be extracted from '{file_name}'.")
 
         chunks = _splitter.split_documents(documents)
-        texts = [chunk.page_content for chunk in chunks]
-        metadatas = [
-            {
-                "doc_id": doc_id,
-                "user_id": user_id,        # ← scopes this doc to the user
-                "file_name": file_name,
-                "page": str(chunk.metadata.get("page", "unknown")),
-            }
-            for chunk in chunks
-        ]
-        embeddings_list = _embeddings.embed_documents(texts)
-        chunk_ids = [f"{doc_id}_{i}" for i in range(len(chunks))]
+        texts = [c.page_content for c in chunks]
+        embeddings_list = await _embeddings.aembed_documents(texts)
 
-        with self._lock:
-            self._collection.add(
-                ids=chunk_ids,
-                embeddings=embeddings_list,
-                documents=texts,
-                metadatas=metadatas,
-            )
+        doc_id = str(uuid.uuid4())
+
+        rows = [
+            {
+                "id": f"{doc_id}_{i}",
+                "doc_id": doc_id,
+                "user_id": user_id,
+                "file_name": file_name,
+                "page": str(chunks[i].metadata.get("page", "unknown")),
+                "content": texts[i],
+                "vec": _vec_literal(embeddings_list[i]),
+            }
+            for i in range(len(chunks))
+        ]
+
+        await db.execute(
+            text(
+                "INSERT INTO document_chunks "
+                "(id, doc_id, user_id, file_name, page, content, embedding) "
+                "VALUES (:id, :doc_id, :user_id, :file_name, :page, :content, :vec::vector)"
+            ),
+            rows,
+        )
 
         return doc_id
 
     # ------------------------------------------------------------------
-    # List documents — filtered by user_id
+    # Delete
     # ------------------------------------------------------------------
 
-    def list_documents(self, user_id: str) -> list[dict]:
-        results = self._collection.get(
-            where={"user_id": {"$eq": user_id}},
-            include=["metadatas"],
+    async def delete_document_by_id(self, doc_id: str, db: AsyncSession) -> None:
+        await db.execute(
+            text("DELETE FROM document_chunks WHERE doc_id = :doc_id"),
+            {"doc_id": doc_id},
         )
-        metadatas = results.get("metadatas", [])
-        seen: dict[str, dict] = {}
-        for meta in metadatas:
-            doc_id = meta.get("doc_id")
-            if doc_id and doc_id not in seen:
-                seen[doc_id] = {
-                    "doc_id": doc_id,
-                    "file_name": meta.get("file_name"),
-                }
-        return list(seen.values())
-
-    # ------------------------------------------------------------------
-    # Delete document — verifies ownership
-    # ------------------------------------------------------------------
-
-    def delete_document(self, doc_id: str, user_id: str) -> None:
-        """
-        Delete all chunks for a doc_id.
-        Verifies the doc belongs to user_id first — raises PermissionError if not.
-        """
-        # Check ownership by fetching one chunk's metadata
-        results = self._collection.get(
-            where={"$and": [
-                {"doc_id": {"$eq": doc_id}},
-                {"user_id": {"$eq": user_id}},
-            ]},
-            include=["metadatas"],
-            limit=1,
-        )
-        if not results["ids"]:
-            raise PermissionError(
-                "Document not found or does not belong to this user."
-            )
-
-        # Delete all chunks for this doc_id
-        self._collection.delete(where={"doc_id": {"$eq": doc_id}})
-
-    # ------------------------------------------------------------------
-    # Delete by id — caller is responsible for authorization
-    # ------------------------------------------------------------------
-
-    def delete_document_by_id(self, doc_id: str) -> None:
-        with self._lock:
-            self._collection.delete(where={"doc_id": {"$eq": doc_id}})
 
     # ------------------------------------------------------------------
     # Streaming query
@@ -329,7 +248,7 @@ class DocumentStore:
         user_id: str = "",
     ) -> AsyncGenerator[str, None]:
         prompt, selected_metas = await _build_retrieval_inputs(
-            query, session_id, doc_ids, user_id, self._collection, db
+            query, session_id, doc_ids, user_id, db
         )
 
         full_answer = []
@@ -347,14 +266,10 @@ class DocumentStore:
         await history.add_message(db, session_id, "user", query, user_id=user_id)
         await history.add_message(db, session_id, "assistant", answer, user_id=user_id)
 
-        # Generate a title on the first message of a new session.
-        # We check message count — if only 2 rows exist (the ones we just inserted),
-        # this is the first turn so we generate and save a title.
         session_obj = await history.ensure_session(db, session_id, user_id=user_id)
         if session_obj.title is None:
             title = await generate_title(query)
             await history.update_session_title(db, session_id, title)
-            # Send title to frontend so sidebar updates immediately
             yield f"data: [TITLE]{title}\n\n"
 
         sources = _dedupe_sources(selected_metas)
@@ -374,7 +289,7 @@ class DocumentStore:
         user_id: str = "",
     ) -> dict:
         prompt, selected_metas = await _build_retrieval_inputs(
-            query, session_id, doc_ids, user_id, self._collection, db
+            query, session_id, doc_ids, user_id, db
         )
 
         try:
@@ -386,7 +301,6 @@ class DocumentStore:
         await history.add_message(db, session_id, "user", query, user_id=user_id)
         await history.add_message(db, session_id, "assistant", answer, user_id=user_id)
 
-        # Generate title on first message
         session_obj = await history.ensure_session(db, session_id, user_id=user_id)
         if session_obj.title is None:
             title = await generate_title(query)
@@ -397,7 +311,7 @@ class DocumentStore:
         return {
             "answer": answer,
             "sources": _dedupe_sources(selected_metas),
-            "title": title,  # None if not first message, string if newly generated
+            "title": title,
         }
 
 
