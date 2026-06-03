@@ -89,10 +89,10 @@ async def upload_file(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
-    except Exception:
+    except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to process the uploaded file.",
+            detail=f"Failed to process the uploaded file: {e}",
         )
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)

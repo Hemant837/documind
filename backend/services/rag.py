@@ -122,7 +122,7 @@ async def _build_retrieval_inputs(
                 f"SELECT file_name, page, content "
                 f"FROM document_chunks "
                 f"WHERE {where_clause} "
-                f"ORDER BY embedding <=> :vec::vector "
+                f"ORDER BY embedding <=> CAST(:vec AS vector) "
                 f"LIMIT :k"
             ),
             params,
@@ -201,8 +201,13 @@ class DocumentStore:
 
         doc_id = str(uuid.uuid4())
 
-        rows = [
-            {
+        insert_sql = text(
+            "INSERT INTO document_chunks "
+            "(id, doc_id, user_id, file_name, page, content, embedding) "
+            "VALUES (:id, :doc_id, :user_id, :file_name, :page, :content, CAST(:vec AS vector))"
+        )
+        for i in range(len(chunks)):
+            await db.execute(insert_sql, {
                 "id": f"{doc_id}_{i}",
                 "doc_id": doc_id,
                 "user_id": user_id,
@@ -210,18 +215,7 @@ class DocumentStore:
                 "page": str(chunks[i].metadata.get("page", "unknown")),
                 "content": texts[i],
                 "vec": _vec_literal(embeddings_list[i]),
-            }
-            for i in range(len(chunks))
-        ]
-
-        await db.execute(
-            text(
-                "INSERT INTO document_chunks "
-                "(id, doc_id, user_id, file_name, page, content, embedding) "
-                "VALUES (:id, :doc_id, :user_id, :file_name, :page, :content, :vec::vector)"
-            ),
-            rows,
-        )
+            })
 
         return doc_id
 
